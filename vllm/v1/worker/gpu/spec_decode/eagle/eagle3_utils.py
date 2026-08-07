@@ -58,16 +58,11 @@ def supports_aux_hidden_states_over_pp(model: nn.Module) -> bool:
 def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
     """Declare the aux slots the last PP stage reads its upstream taps from.
 
-    The V2 runner does not forward a received tensor dict straight to the
-    model: it copies it into a persistent buffer built once from
-    `make_empty_intermediate_tensors`, so the CUDA graphs keep seeing the same
-    addresses. One slot is reserved per upstream tap
-    (`EagleModelMixin.pack_local_aux_for_last` numbers them globally): the
-    pre-last stage's taps land in their slots through that copy, since they
-    ride the pipeline handoff, and earlier stages' direct sends are written
-    into theirs by `AuxTapReceiver` before the forward launches. Without the
-    reservation the handoff copy silently drops unknown keys and the drafter
-    reads stale buffer contents, losing acceptance without failing.
+    The V2 runner copies a received tensor dict into a persistent buffer built
+    once from `make_empty_intermediate_tensors` and silently drops keys that
+    buffer does not have, so one slot per upstream tap has to be declared up
+    front or the drafter reads stale contents and loses acceptance without
+    failing. Slots are numbered globally by `pack_local_aux_for_last`.
     """
     from vllm.distributed.parallel_state import get_pp_group
 

@@ -2,28 +2,20 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Direct transport for EAGLE3-style aux hidden states under pipeline parallelism.
 
-EAGLE3-style drafting runs on the last PP rank but taps hidden states from
-layers that may live on earlier stages. Stages at least two hops from the end
-send their taps straight to the last rank instead of relaying them through
-every intermediate handoff; the stage right before the last one keeps its taps
-inside the ``IntermediateTensors`` handoff it already sends.
+Drafting runs on the last PP rank but taps layers that may live on earlier
+stages. Stages at least two hops from the end send their taps straight to the
+last rank; the stage right before it keeps its taps in the
+``IntermediateTensors`` handoff it already sends.
 
-All communication lives here, in eager runner code, so the model forward stays
-free of host-side comm state and remains capturable by full CUDA graphs:
+Communication lives here rather than in the model forward, which keeps the
+forward free of host-side comm state and capturable by full CUDA graphs. The
+sender stages a private copy because the forward's output is a capture buffer
+the next replay rewrites, while the receiver can write straight into the
+persistent input slots the graphs captured.
 
-- ``AuxTapSender`` copies the taps out of the forward's output -- which under
-  full-cudagraph is a capture buffer the next replay rewrites -- into private
-  staging tensors and ``isend``s those, keeping each alive until NCCL has
-  finished reading it.
-- ``AuxTapReceiver`` posts ``irecv``s into the persistent aux slots of the
-  last rank's ``IntermediateTensors`` input buffer -- the same fixed addresses
-  the CUDA graphs captured -- before the forward is launched. The ``wait`` on
-  each recv orders the NCCL write ahead of later work on the current stream,
-  so a graph replay launched afterwards reads fresh data.
-
-Both legs rely on every rank padding a batch to the same token count, which
-lets the send and recv sides agree on element counts without a blocking
-metadata exchange (an NCCL count mismatch deadlocks rather than erroring).
+Send and recv agree on element counts without a metadata exchange because every
+rank pads a batch to the same token count. An NCCL count mismatch deadlocks
+rather than erroring, so that invariant is load-bearing.
 """
 
 import torch
@@ -52,10 +44,7 @@ class AuxTapSender:
         """Drop completed sends, bounding how many stay pinned.
 
         A stage runs ahead of the last rank by up to ``pp_size`` microbatches,
-        so a send is not necessarily consumed before this stage's next
-        forward. Waiting unconditionally would stall the pipeline; instead
-        drop whatever has completed and only block once more than a pipeline's
-        worth is queued.
+        so waiting unconditionally would stall the pipeline.
         """
         pending = [(h, t) for h, t in self._in_flight if not h.is_completed()]
         while len(pending) > self._max_in_flight:
