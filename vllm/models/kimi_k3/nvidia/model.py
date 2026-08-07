@@ -1020,6 +1020,15 @@ class KimiLinearModel(nn.Module, EagleModelMixin, SupportsQuant):
 
     # Local aux taps are sent directly to the last PP rank for EAGLE3 drafting.
     supports_aux_hidden_states_over_pp = True
+    supports_boundary_aux_reconstruction = True
+
+    def rebuild_boundary_aux(
+        self, intermediate_tensors: IntermediateTensors
+    ) -> torch.Tensor:
+        if self.use_attn_res:
+            # The handoff already folds prefix_sum in, so it is the tap.
+            return intermediate_tensors["hidden_states"]
+        return intermediate_tensors["hidden_states"] + intermediate_tensors["residual"]
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
