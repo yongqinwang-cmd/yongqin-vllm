@@ -57,9 +57,6 @@ def load_dspark_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mo
     target_embed = getattr(target_inner, "embed_tokens", None)
     draft_embed = getattr(draft_inner, "embed_tokens", None)
     if isinstance(target_embed, PPMissingLayer):
-        # Target models gate embed_tokens with needs_dspark_target_embed(),
-        # which instantiates it on the last PP rank so the regular weight
-        # loader fills it and it can simply be aliased here.
         raise RuntimeError(
             f"{type(target_inner).__name__} has no embed_tokens on the last "
             "PP rank; instantiate it when needs_dspark_target_embed() is true "

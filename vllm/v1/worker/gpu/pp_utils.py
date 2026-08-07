@@ -132,9 +132,8 @@ class PPHandler:
             idx_mapping=idx_mapping,
         )
         if slot.draft_tokens is not None:
-            # Drop freed/excluded rows: -1 sentinels would alias the last row
-            # under advanced indexing, and unfiltered writes can hit a reused
-            # req index after add_requests zeroed it.
+            # Drop freed rows: their req index may already belong to a new
+            # request by the time this deferred write lands.
             if exclude_mask.any():
                 keep = ~exclude_mask
                 keep_t = torch.as_tensor(keep, device=self.device)
