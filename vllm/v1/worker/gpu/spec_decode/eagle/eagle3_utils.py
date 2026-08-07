@@ -56,16 +56,18 @@ def supports_aux_hidden_states_over_pp(model: nn.Module) -> bool:
 
 
 def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
-    """Declare the aux slots the last PP stage receives inline.
+    """Declare the aux slots the last PP stage reads its upstream taps from.
 
-    The stage before the last one ships its taps inside the pipeline handoff
-    (`EagleModelMixin.pack_local_aux_for_last`). The V2 runner does not forward
-    a received tensor dict straight to the model: it copies it into a
-    persistent buffer built once from `make_empty_intermediate_tensors`, so the
-    CUDA graphs keep seeing the same addresses, and any key that buffer does
-    not already have is silently dropped. Unless those slots are declared here
-    the taps never reach the drafter, which then reads whatever the buffer held
-    and loses acceptance without failing.
+    The V2 runner does not forward a received tensor dict straight to the
+    model: it copies it into a persistent buffer built once from
+    `make_empty_intermediate_tensors`, so the CUDA graphs keep seeing the same
+    addresses. One slot is reserved per upstream tap
+    (`EagleModelMixin.pack_local_aux_for_last` numbers them globally): the
+    pre-last stage's taps land in their slots through that copy, since they
+    ride the pipeline handoff, and earlier stages' direct sends are written
+    into theirs by `AuxTapReceiver` before the forward launches. Without the
+    reservation the handoff copy silently drops unknown keys and the drafter
+    reads stale buffer contents, losing acceptance without failing.
     """
     from vllm.distributed.parallel_state import get_pp_group
 
@@ -76,7 +78,8 @@ def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
     if not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         return
 
-    num_taps = inner._num_local_taps_on_rank(pp.world_size - 2, pp.world_size)
+    # Total taps produced by ranks 0..last-1.
+    num_taps = inner._aux_slot_base(pp.world_size - 1, pp.world_size)
     if num_taps == 0:
         return
 
@@ -94,8 +97,8 @@ def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
 
     model.make_empty_intermediate_tensors = make_empty_with_aux
     logger.info(
-        "Reserved %d aux hidden-state slot(s) in the PP handoff for taps "
-        "produced by stage %d.",
+        "Reserved %d aux hidden-state slot(s) on the last PP stage for taps "
+        "produced by stages 0..%d.",
         num_taps,
         pp.world_size - 2,
     )

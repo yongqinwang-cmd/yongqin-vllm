@@ -119,6 +119,11 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.eagle.aux_pp_transport import (
+    AuxTapReceiver,
+    AuxTapSender,
+    init_aux_pp_transport,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
     supports_aux_hidden_states_over_pp,
@@ -213,6 +218,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Speculative decoding.
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
+        # Runner-side transport for aux hidden states under PP (see
+        # aux_pp_transport). Built in load_model once aux layers are known.
+        self.aux_pp_sender: AuxTapSender | None = None
+        self.aux_pp_receiver: AuxTapReceiver | None = None
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -340,6 +349,10 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         f"{self.speculative_config.method} with pipeline parallel "
                         f"is not supported by {type(self.model).__name__}: it does "
                         "not forward auxiliary hidden states across pipeline stages."
+                    )
+                if self.use_pp:
+                    self.aux_pp_sender, self.aux_pp_receiver = init_aux_pp_transport(
+                        self.model
                     )
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.load_model(self.model)
@@ -1419,9 +1432,15 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             assert intermediate_tensors is not None
             assert self.intermediate_tensors is not None
             n = input_batch.num_tokens_after_padding
+            if not dummy_run and self.aux_pp_receiver is not None:
+                # Far stages' direct-sent aux taps land in the same persistent
+                # slots the handoff copy below fills for the pre-last stage's.
+                self.aux_pp_receiver.recv_into(self.intermediate_tensors, n)
             new_tensors = {
+                # Keys absent from the received handoff are the aux slots the
+                # receiver above just filled in place.
                 k: v[:n]
-                if dummy_run
+                if dummy_run or k not in intermediate_tensors.tensors
                 else v[:n].copy_(intermediate_tensors.tensors[k][:n])
                 for k, v in self.intermediate_tensors.tensors.items()
             }
@@ -1504,6 +1523,12 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
+            if not dummy_run and self.aux_pp_sender is not None:
+                # Far stage: pull the local aux taps out of the handoff
+                # payload and send them straight to the last rank.
+                output_intermediate_tensors = self.aux_pp_sender.extract_and_send(
+                    output_intermediate_tensors
+                )
             return output_intermediate_tensors
         return None
 

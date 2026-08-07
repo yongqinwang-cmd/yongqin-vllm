@@ -74,6 +74,7 @@ from .utils import (
     make_empty_intermediate_tensors_factory,
     make_layers,
     maybe_prefix,
+    needs_dspark_target_embed,
 )
 
 
@@ -372,8 +373,10 @@ class LlamaModel(nn.Module, EagleModelMixin):
 
         self.vocab_size = config.vocab_size
 
-        if get_pp_group().is_first_rank or (
-            config.tie_word_embeddings and get_pp_group().is_last_rank
+        if (
+            get_pp_group().is_first_rank
+            or (config.tie_word_embeddings and get_pp_group().is_last_rank)
+            or needs_dspark_target_embed(vllm_config)
         ):
             self.embed_tokens = VocabParallelEmbedding(
                 self.vocab_size,
@@ -420,9 +423,7 @@ class LlamaModel(nn.Module, EagleModelMixin):
 
         remote_aux: list[torch.Tensor] = []
         if get_pp_group().is_last_rank and self.aux_hidden_state_layers:
-            remote_aux = self.recv_remote_aux_from_producers(
-                hidden_states, intermediate_tensors
-            )
+            remote_aux = self.recv_remote_aux_from_producers(intermediate_tensors)
 
         aux_hidden_states: list[torch.Tensor] = []
         if get_pp_group().is_first_rank:
