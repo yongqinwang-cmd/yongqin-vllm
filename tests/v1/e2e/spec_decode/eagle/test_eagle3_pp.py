@@ -38,7 +38,6 @@ def test_eagle3_pipeline_parallel_greedy_parity(
         pipeline_parallel_size=pp_size,
         max_model_len=512,
         gpu_memory_utilization=0.45,
-        enforce_eager=True,
         disable_log_stats=True,
     )
     sampling = SamplingParams(temperature=0.0, max_tokens=32, ignore_eos=True)

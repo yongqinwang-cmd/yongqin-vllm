@@ -120,6 +120,7 @@ from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
+    aux_pp_relay_keys,
     set_eagle3_aux_hidden_state_layers,
     supports_aux_hidden_states_over_pp,
 )
@@ -213,6 +214,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         # Speculative decoding.
         self.speculator = None
         self.use_aux_hidden_state_outputs = False
+        # Upstream aux taps this stage passes on in its handoff. Filled in
+        # load_model once the aux layers are known.
+        self.aux_pp_relay_keys: tuple[str, ...] = ()
         self.num_speculative_steps = vllm_config.num_speculative_tokens
         if self.speculative_config is not None:
             if self.is_last_pp_rank:
@@ -341,6 +345,8 @@ class GPUModelRunner(LoRAModelRunnerMixin):
                         f"is not supported by {type(self.model).__name__}: it does "
                         "not forward auxiliary hidden states across pipeline stages."
                     )
+                if self.use_pp:
+                    self.aux_pp_relay_keys = aux_pp_relay_keys(self.model)
             if isinstance(self.speculator, DraftModelSpeculator):
                 self.speculator.load_model(self.model)
                 eplb_models_added = self.eplb.maybe_register_speculator(
@@ -1504,6 +1510,16 @@ class GPUModelRunner(LoRAModelRunnerMixin):
 
         if not self.is_last_pp_rank:
             # Non-last PP rank: return IntermediateTensors for sending.
+            if self.aux_pp_relay_keys:
+                # The forward packs only this stage's own taps, so add the
+                # upstream ones it received to keep them travelling toward the
+                # last rank. These are the persistent input buffers, so the
+                # payload stays capturable and no copy is needed here.
+                received = model_inputs["intermediate_tensors"]
+                output_intermediate_tensors = IntermediateTensors(
+                    output_intermediate_tensors.tensors
+                    | {k: received[k] for k in self.aux_pp_relay_keys}
+                )
             return output_intermediate_tensors
         return None
 

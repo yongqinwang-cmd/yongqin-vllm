@@ -55,28 +55,50 @@ def supports_aux_hidden_states_over_pp(model: nn.Module) -> bool:
     return bool(getattr(inner, "supports_aux_hidden_states_over_pp", False))
 
 
-def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
-    """Declare the aux slots the last PP stage receives inline.
+def aux_pp_relay_keys(model: nn.Module) -> tuple[str, ...]:
+    """Keys of upstream stages' aux taps this rank passes on toward the last.
 
-    The stage before the last one ships its taps inside the pipeline handoff
-    (`EagleModelMixin.pack_local_aux_for_last`). The V2 runner does not forward
-    a received tensor dict straight to the model: it copies it into a
-    persistent buffer built once from `make_empty_intermediate_tensors`, so the
-    CUDA graphs keep seeing the same addresses, and any key that buffer does
-    not already have is silently dropped. Unless those slots are declared here
-    the taps never reach the drafter, which then reads whatever the buffer held
-    and loses acceptance without failing.
+    Slots are numbered globally, so the taps produced before this stage are
+    exactly slots ``[0, _aux_slot_base(rank))``. The last rank consumes them
+    rather than relaying, and the first rank has no upstream.
     """
     from vllm.distributed.parallel_state import get_pp_group
 
     pp = get_pp_group()
-    if pp.world_size < 2 or not pp.is_last_rank:
+    if pp.world_size < 2 or pp.is_first_rank or pp.is_last_rank:
+        return ()
+    inner = _inner_decoder(model)
+    if not getattr(inner, "supports_aux_hidden_states_over_pp", False):
+        return ()
+    num_upstream = inner._aux_slot_base(pp.rank_in_group, pp.world_size)
+    key = inner.AUX_HIDDEN_STATE_KEY
+    return tuple(f"{key}{i}" for i in range(num_upstream))
+
+
+def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
+    """Declare the aux slots this stage receives from upstream.
+
+    The V2 runner does not forward a received tensor dict straight to the
+    model: it copies it into a persistent buffer built once from
+    `make_empty_intermediate_tensors`, so the CUDA graphs keep seeing the same
+    addresses, and any key that buffer does not have is silently dropped.
+    Aux taps ride the pipeline handoff all the way to the last rank, so every
+    stage past the first needs a slot for each tap produced upstream of it:
+    globally numbered, that is slots `[0, _aux_slot_base(rank))`. Without the
+    reservation a relayed tap is dropped on arrival and the drafter reads
+    stale buffer contents, losing acceptance without failing.
+    """
+    from vllm.distributed.parallel_state import get_pp_group
+
+    pp = get_pp_group()
+    if pp.world_size < 2 or pp.is_first_rank:
         return
     inner = _inner_decoder(model)
     if not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         return
 
-    num_taps = inner._num_local_taps_on_rank(pp.world_size - 2, pp.world_size)
+    # Taps produced by every stage upstream of this one.
+    num_taps = inner._aux_slot_base(pp.rank_in_group, pp.world_size)
     if num_taps == 0:
         return
 
@@ -95,9 +117,9 @@ def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
     model.make_empty_intermediate_tensors = make_empty_with_aux
     logger.info(
         "Reserved %d aux hidden-state slot(s) in the PP handoff for taps "
-        "produced by stage %d.",
+        "produced by stages 0..%d.",
         num_taps,
-        pp.world_size - 2,
+        pp.rank_in_group - 1,
     )
 
 
