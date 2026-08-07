@@ -1448,6 +1448,44 @@ class EagleModelMixin:
 
     AUX_HIDDEN_STATE_KEY: ClassVar[str] = "aux_hidden_states_"
 
+    # Set by models that implement rebuild_boundary_aux.
+    supports_boundary_aux_reconstruction: ClassVar[bool] = False
+
+    def rebuild_boundary_aux(
+        self, intermediate_tensors: "IntermediateTensors"
+    ) -> torch.Tensor:
+        """Rebuild the tap taken at the sending stage's ``end_layer``.
+
+        How depends on how the model composes its residual stream, so only
+        models that opt in implement it.
+        """
+        raise NotImplementedError
+
+    def _boundary_aux_slot(self) -> int | None:
+        """Slot of the pre-last stage's end-of-window tap, if it need not be sent.
+
+        A tap taken at a stage's ``end_layer`` is a function of the hidden states
+        that same stage hands off, so sending both puts a redundant tensor on the
+        hop already carrying them. Only the pre-last stage qualifies: every
+        earlier stage hands off to a rank that is not the consumer.
+        """
+        if not self.supports_boundary_aux_reconstruction:
+            return None
+        from vllm.distributed.parallel_state import get_pp_group
+        from vllm.distributed.utils import get_pp_indices
+
+        pp = get_pp_group()
+        if pp.world_size < 2:
+            return None
+        producer = pp.world_size - 2
+        start, end = get_pp_indices(self._total_num_layers(), producer, pp.world_size)
+        taps = self.local_aux_tap_ids(
+            start, end, tuple(self.aux_hidden_state_layers), producer == 0
+        )
+        if not taps or taps[-1] != end:
+            return None
+        return self._aux_slot_base(producer, pp.world_size) + len(taps) - 1
+
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.aux_hidden_state_layers = layers
 
@@ -1522,10 +1560,16 @@ class EagleModelMixin:
         if pp.world_size == 1 or pp.is_last_rank or not aux_hidden_states:
             return {}
         base = self._aux_slot_base(pp.rank_in_group, pp.world_size)
-        return {
+        tensors = {
             f"{self.AUX_HIDDEN_STATE_KEY}{base + i}": t
             for i, t in enumerate(aux_hidden_states)
         }
+        if pp.rank_in_group == pp.world_size - 2:
+            boundary = self._boundary_aux_slot()
+            if boundary is not None:
+                # The last rank rebuilds this one from the hidden states below.
+                tensors.pop(f"{self.AUX_HIDDEN_STATE_KEY}{boundary}", None)
+        return tensors
 
     def recv_remote_aux_from_producers(
         self, intermediate_tensors: "IntermediateTensors | None"
@@ -1546,8 +1590,12 @@ class EagleModelMixin:
             return []
 
         assert intermediate_tensors is not None
+        boundary = self._boundary_aux_slot()
         out: list[torch.Tensor] = []
         for i in range(total):
+            if i == boundary:
+                out.append(self.rebuild_boundary_aux(intermediate_tensors))
+                continue
             key = f"{self.AUX_HIDDEN_STATE_KEY}{i}"
             if key not in intermediate_tensors.tensors:
                 # Substituting zeros here would cost acceptance without failing.
