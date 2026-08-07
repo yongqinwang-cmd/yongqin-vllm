@@ -16,23 +16,54 @@ persistent input slots the graphs captured.
 Send and recv agree on element counts without a metadata exchange because every
 rank pads a batch to the same token count. An NCCL count mismatch deadlocks
 rather than erroring, so that invariant is load-bearing.
+
+The taps travel on their own communicator, not the one carrying the handoff.
+See _new_aux_pp_group for why sharing it deadlocks from pp_size 3 up.
 """
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from vllm.distributed.parallel_state import get_pp_group
+from vllm.distributed.parallel_state import get_pp_group, get_world_group
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import _inner_decoder
+
+
+def _new_aux_pp_group() -> dist.ProcessGroup:
+    """Build a second communicator over this rank's PP ranks, for taps only.
+
+    NCCL matches point-to-point operations per communicator, in issue order, so
+    a tap sent on the PP communicator sits behind that stage's handoff send. At
+    pp_size >= 3 that is a deadlock rather than a slowdown: stage 0 blocks in
+    the tap send, stage 1 waits for stage 0's handoff, and the last rank waits
+    for stage 1's handoff, so it never reaches the matching tap recv. Giving the
+    taps their own communicator removes the ordering relationship.
+
+    Creating a group is collective over the whole world, so every rank walks the
+    same sorted list of PP groups and keeps the one it belongs to.
+    """
+    world = get_world_group()
+    mine = list(get_pp_group().ranks)
+    gathered: list[list[int] | None] = [None] * world.world_size
+    dist.all_gather_object(gathered, mine, group=world.cpu_group)
+
+    my_rank = dist.get_rank()
+    aux_group = None
+    for ranks in sorted({tuple(r) for r in gathered if r is not None}):
+        group = dist.new_group(ranks=list(ranks), backend="nccl")
+        if my_rank in ranks:
+            aux_group = group
+    assert aux_group is not None, "this rank belongs to no PP group"
+    return aux_group
 
 
 class AuxTapSender:
     """Sends a far stage's local aux taps straight to the last PP rank."""
 
-    def __init__(self, key_prefix: str, max_in_flight: int):
+    def __init__(self, key_prefix: str, max_in_flight: int, group: dist.ProcessGroup):
         pp = get_pp_group()
-        self._group = pp.device_group
+        self._group = group
         self._dst = pp.ranks[-1]
         self._key_prefix = key_prefix
         self._max_in_flight = max_in_flight
@@ -80,10 +111,10 @@ class AuxTapSender:
 class AuxTapReceiver:
     """Receives far stages' aux taps into the last rank's persistent buffer."""
 
-    def __init__(self, slots: list[tuple[int, str]]):
+    def __init__(self, slots: list[tuple[int, str]], group: dist.ProcessGroup):
         # (source global rank, persistent-buffer key), ordered by producer
         # rank then tap, matching each sender's send order per rank.
-        self._group = get_pp_group().device_group
+        self._group = group
         self._slots = slots
 
     def recv_into(
@@ -115,13 +146,16 @@ def init_aux_pp_transport(
     if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         return None, None
 
+    # Collective, so it has to happen before any rank-dependent return below.
+    aux_group = _new_aux_pp_group()
+
     last = pp.world_size - 1
     rank = pp.rank_in_group
     prefix = inner.AUX_HIDDEN_STATE_KEY
     if rank < last - 1:
         if inner._num_local_taps_on_rank(rank, pp.world_size) == 0:
             return None, None
-        return AuxTapSender(prefix, max_in_flight=pp.world_size), None
+        return AuxTapSender(prefix, pp.world_size, aux_group), None
     if rank == last:
         slots: list[tuple[int, str]] = []
         for r in range(last - 1):
@@ -130,6 +164,6 @@ def init_aux_pp_transport(
                 slots.append((pp.ranks[r], f"{prefix}{base + j}"))
         if not slots:
             return None, None
-        return None, AuxTapReceiver(slots)
+        return None, AuxTapReceiver(slots, aux_group)
     # Stage right before the last one: taps ride the handoff.
     return None, None
