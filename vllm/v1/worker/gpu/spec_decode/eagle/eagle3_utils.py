@@ -78,15 +78,12 @@ def aux_pp_relay_keys(model: nn.Module) -> tuple[str, ...]:
 def reserve_aux_intermediate_tensor_slots(model: nn.Module) -> None:
     """Declare the aux slots this stage receives from upstream.
 
-    The V2 runner does not forward a received tensor dict straight to the
-    model: it copies it into a persistent buffer built once from
-    `make_empty_intermediate_tensors`, so the CUDA graphs keep seeing the same
-    addresses, and any key that buffer does not have is silently dropped.
-    Aux taps ride the pipeline handoff all the way to the last rank, so every
-    stage past the first needs a slot for each tap produced upstream of it:
-    globally numbered, that is slots `[0, _aux_slot_base(rank))`. Without the
-    reservation a relayed tap is dropped on arrival and the drafter reads
-    stale buffer contents, losing acceptance without failing.
+    The V2 runner copies a received tensor dict into a persistent buffer built
+    once from `make_empty_intermediate_tensors` and silently drops keys that
+    buffer does not have. Taps ride the handoff all the way to the last rank, so
+    every stage past the first must declare slots `[0, _aux_slot_base(rank))`
+    up front or a relayed tap is dropped on arrival and the drafter reads stale
+    contents, losing acceptance without failing.
     """
     from vllm.distributed.parallel_state import get_pp_group
 

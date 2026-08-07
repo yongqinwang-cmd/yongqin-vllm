@@ -1501,10 +1501,9 @@ class EagleModelMixin:
     def _aux_slot_base(self, rank: int, pp_world_size: int) -> int:
         """Global slot index of ``rank``'s first tap on the last stage.
 
-        Upstream taps occupy one slot each, ordered by producer rank and then
-        by tap: slots ``[base(r), base(r) + num_taps(r))`` belong to stage
-        ``r``. Every stage derives the same numbering from the layer split,
-        so no negotiation is needed.
+        Taps occupy one slot each, ordered by producer rank then by tap. Every
+        stage derives the same numbering from the layer split, so the slots need
+        no negotiation.
         """
         return sum(self._num_local_taps_on_rank(r, pp_world_size) for r in range(rank))
 
@@ -1513,11 +1512,9 @@ class EagleModelMixin:
     ) -> dict[str, torch.Tensor]:
         """Expose this stage's own aux taps to the runner, keyed by global slot.
 
-        Pure packing -- no communication happens inside the forward, which
-        keeps it capturable by full CUDA graphs. The taps ride the
-        ``IntermediateTensors`` handoff the pipeline already sends; each
-        intermediate stage passes on what it received alongside its own, so
-        they reach the last rank without a separate channel.
+        Pure packing, so the forward stays capturable by full CUDA graphs. The
+        taps ride the ``IntermediateTensors`` handoff, with each stage passing on
+        what it received alongside its own.
         """
         from vllm.distributed.parallel_state import get_pp_group
 
@@ -1535,10 +1532,9 @@ class EagleModelMixin:
     ) -> list[torch.Tensor]:
         """Collect earlier stages' aux taps on the last rank, in tap order.
 
-        Pure gather -- by the time the forward runs, the pipeline handoff has
-        placed every upstream tap in this rank's persistent
-        ``IntermediateTensors`` buffer. Reading fixed buffer slots keeps the
-        forward capturable by full CUDA graphs.
+        Pure gather: the pipeline handoff has already placed every upstream tap
+        in this rank's persistent ``IntermediateTensors`` buffer, so reading
+        fixed slots keeps the forward capturable by full CUDA graphs.
         """
         from vllm.distributed.parallel_state import get_pp_group
 
@@ -1554,9 +1550,7 @@ class EagleModelMixin:
         for i in range(total):
             key = f"{self.AUX_HIDDEN_STATE_KEY}{i}"
             if key not in intermediate_tensors.tensors:
-                # Silently substituting zeros here costs acceptance without
-                # failing, so make a missing slot loud instead. See
-                # reserve_aux_intermediate_tensor_slots.
+                # Substituting zeros here would cost acceptance without failing.
                 raise RuntimeError(
                     f"{key} missing from the last stage's intermediate-tensor "
                     "buffer; the aux slots were not reserved "
