@@ -17,46 +17,20 @@ Send and recv agree on element counts without a metadata exchange because every
 rank pads a batch to the same token count. An NCCL count mismatch deadlocks
 rather than erroring, so that invariant is load-bearing.
 
-The taps travel on their own communicator, and the connections carrying them
-are established at load time. See _new_aux_pp_group and
-_warm_up_tap_connections for why skipping either deadlocks from pp_size 3 up.
+The taps get a communicator of their own without asking for one: torch gives
+every unbatched point-to-point pair a private two-rank communicator and stream,
+so a tap never queues behind the handoff. What it does not do is open that
+connection ahead of time. See _warm_up_tap_connections for why leaving it to
+the first step deadlocks from pp_size 3 up.
 """
 
 import torch
 import torch.distributed as dist
 import torch.nn as nn
 
-from vllm.distributed.parallel_state import get_pp_group, get_world_group
+from vllm.distributed.parallel_state import get_pp_group
 from vllm.sequence import IntermediateTensors
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import _inner_decoder
-
-
-def _new_aux_pp_group() -> dist.ProcessGroup:
-    """Build a second communicator over this rank's PP ranks, for taps only.
-
-    NCCL matches point-to-point operations per communicator, in issue order, so
-    a tap sent on the PP communicator sits behind that stage's handoff send. At
-    pp_size >= 3 that is a deadlock rather than a slowdown: stage 0 blocks in
-    the tap send, stage 1 waits for stage 0's handoff, and the last rank waits
-    for stage 1's handoff, so it never reaches the matching tap recv. Giving the
-    taps their own communicator removes the ordering relationship.
-
-    Creating a group is collective over the whole world, so every rank walks the
-    same sorted list of PP groups and keeps the one it belongs to.
-    """
-    world = get_world_group()
-    mine = list(get_pp_group().ranks)
-    gathered: list[list[int] | None] = [None] * world.world_size
-    dist.all_gather_object(gathered, mine, group=world.cpu_group)
-
-    my_rank = dist.get_rank()
-    aux_group = None
-    for ranks in sorted({tuple(r) for r in gathered if r is not None}):
-        group = dist.new_group(ranks=list(ranks), backend="nccl")
-        if my_rank in ranks:
-            aux_group = group
-    assert aux_group is not None, "this rank belongs to no PP group"
-    return aux_group
 
 
 def _warm_up_tap_connections(
@@ -64,11 +38,11 @@ def _warm_up_tap_connections(
 ) -> None:
     """Open each producer-to-last connection while every rank is idle.
 
-    isend does not return until the matching recv is posted, because an
-    unbatched point-to-point op builds a two-rank NCCL communicator on first
-    use and that build is a rendezvous. Measured on 3 ranks: the first isend
-    returns only once the peer arrives, 8.4s later, while a second isend on the
-    same pair returns in under a millisecond.
+    isend does not return until the matching recv is posted, because the first
+    op to a given peer builds that pair's communicator and connection, and the
+    build is a rendezvous. Measured on 3 ranks: the first isend returns only
+    once the peer arrives, 8.4s later, while a second isend on the same pair
+    returns in under a millisecond.
 
     That first send is unserviceable mid-step. The last rank cannot post the
     matching recv until it has taken delivery of the handoff, and the handoff
@@ -189,15 +163,13 @@ def init_aux_pp_transport(
     if not producers:
         return None, None
 
-    aux_group = _new_aux_pp_group()
-    _warm_up_tap_connections(
-        aux_group, [pp.ranks[r] for r in producers], pp.ranks[last]
-    )
+    group = pp.device_group
+    _warm_up_tap_connections(group, [pp.ranks[r] for r in producers], pp.ranks[last])
 
     if rank < last - 1:
         if rank not in producers:
             return None, None
-        return AuxTapSender(prefix, pp.world_size, aux_group), None
+        return AuxTapSender(prefix, pp.world_size, group), None
     if rank == last:
         slots: list[tuple[int, str]] = []
         for r in range(last - 1):
@@ -206,6 +178,6 @@ def init_aux_pp_transport(
                 slots.append((pp.ranks[r], f"{prefix}{base + j}"))
         if not slots:
             return None, None
-        return None, AuxTapReceiver(slots, aux_group)
+        return None, AuxTapReceiver(slots, group)
     # Stage right before the last one: taps ride the handoff.
     return None, None
