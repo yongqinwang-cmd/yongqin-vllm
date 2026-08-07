@@ -112,9 +112,7 @@ def init_aux_pp_transport(
     if pp.world_size <= 2:
         return None, None
     inner = _inner_decoder(model)
-    if inner is None or not getattr(
-        inner, "supports_aux_hidden_states_over_pp", False
-    ):
+    if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         return None, None
 
     last = pp.world_size - 1
