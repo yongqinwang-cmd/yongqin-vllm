@@ -995,6 +995,15 @@ class DeepseekV4DecoderLayer(nn.Module):
 
 class DeepseekV4Model(nn.Module, EagleModelMixin):
     supports_aux_hidden_states_over_pp = True
+    supports_boundary_aux_reconstruction = True
+
+    def rebuild_boundary_aux(
+        self, intermediate_tensors: IntermediateTensors
+    ) -> torch.Tensor:
+        # When end_layer is a tap layer the handoff is the reconstruction the tap
+        # was reduced from, so the reduction can be redone here.
+        return intermediate_tensors["hidden_states"].mean(dim=1)
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
