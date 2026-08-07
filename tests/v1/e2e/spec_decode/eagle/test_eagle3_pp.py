@@ -17,9 +17,10 @@ PROMPTS = [
     "Q: If a train travels 60 miles in 1.5 hours, what is its average speed?\nA:",
 ]
 
-# The taps arrive over the pipeline handoff, which is deterministic, so PP=2
-# acceptance tracked PP=1 exactly in development. The margin covers scheduling
-# jitter while staying well inside the ~11% drop a dropped tap produced.
+# Measured across PP=1..4 and both cudagraph modes, acceptance stayed inside
+# 2.1395..2.1979, so the spread against a PP=1 baseline is under 2%. The margin
+# covers scheduling jitter while staying well inside the ~11% drop a dropped tap
+# produced.
 ACCEPTANCE_TOLERANCE = 0.95
 
 
@@ -99,5 +100,36 @@ def test_eagle3_pipeline_parallel_acceptance(
     assert parallel >= baseline * ACCEPTANCE_TOLERANCE, (
         f"acceptance length regressed under PP=2 "
         f"(cudagraph_mode={cudagraph_mode}): "
+        f"{parallel:.3f} < {baseline:.3f} * {ACCEPTANCE_TOLERANCE}"
+    )
+
+
+@multi_gpu_test(num_gpus=4)
+@pytest.mark.parametrize(
+    "model,draft",
+    [
+        (
+            "meta-llama/Llama-3.2-1B-Instruct",
+            "nm-testing/Llama3_2_1B_speculator.eagle3",
+        ),
+    ],
+)
+def test_eagle3_pipeline_parallel_far_stage_acceptance(model: str, draft: str):
+    """Cover the stages that do not hand off to the rank consuming their taps.
+
+    PP=2 exercises none of this: its only producer is the stage right before the
+    last one, whose taps ride the handoff it already sends. PP=4 is the smallest
+    size with two such producers, and it is where a tap first has to reach a rank
+    that is not its neighbour.
+
+    Full cudagraph is the mode to run this in. The layout is resolved at setup
+    precisely so the forward stays capturable, and 16 layers over 4 stages splits
+    evenly, so an uneven-split regression would not show up here.
+    """
+    baseline = _run(1, model, draft, "FULL_AND_PIECEWISE")
+    parallel = _run(4, model, draft, "FULL_AND_PIECEWISE")
+
+    assert parallel >= baseline * ACCEPTANCE_TOLERANCE, (
+        f"acceptance length regressed under PP=4: "
         f"{parallel:.3f} < {baseline:.3f} * {ACCEPTANCE_TOLERANCE}"
     )
