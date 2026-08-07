@@ -332,14 +332,6 @@ class Qwen2Model(nn.Module, EagleModelMixin):
         }
     )
     supports_aux_hidden_states_over_pp = True
-    supports_boundary_aux_reconstruction = True
-
-    def rebuild_boundary_aux(
-        self, intermediate_tensors: IntermediateTensors
-    ) -> torch.Tensor:
-        # The add-norm fusion leaves the residual stream unmerged, so a tap is
-        # the sum of the two tensors the handoff carries.
-        return intermediate_tensors["hidden_states"] + intermediate_tensors["residual"]
 
     def __init__(
         self,
