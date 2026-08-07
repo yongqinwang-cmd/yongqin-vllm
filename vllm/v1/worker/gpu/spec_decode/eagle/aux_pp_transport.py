@@ -17,8 +17,9 @@ Send and recv agree on element counts without a metadata exchange because every
 rank pads a batch to the same token count. An NCCL count mismatch deadlocks
 rather than erroring, so that invariant is load-bearing.
 
-The taps travel on their own communicator, not the one carrying the handoff.
-See _new_aux_pp_group for why sharing it deadlocks from pp_size 3 up.
+The taps travel on their own communicator, and the connections carrying them
+are established at load time. See _new_aux_pp_group and
+_warm_up_tap_connections for why skipping either deadlocks from pp_size 3 up.
 """
 
 import torch
@@ -56,6 +57,34 @@ def _new_aux_pp_group() -> dist.ProcessGroup:
             aux_group = group
     assert aux_group is not None, "this rank belongs to no PP group"
     return aux_group
+
+
+def _warm_up_tap_connections(
+    group: dist.ProcessGroup, producers: list[int], dst: int
+) -> None:
+    """Open each producer-to-last connection while every rank is idle.
+
+    isend does not return until the matching recv is posted, because an
+    unbatched point-to-point op builds a two-rank NCCL communicator on first
+    use and that build is a rendezvous. Measured on 3 ranks: the first isend
+    returns only once the peer arrives, 8.4s later, while a second isend on the
+    same pair returns in under a millisecond.
+
+    That first send is unserviceable mid-step. The last rank cannot post the
+    matching recv until it has taken delivery of the handoff, and the handoff
+    is behind the very send that is blocked, so the pipeline closes a cycle on
+    itself. Paying the rendezvous here, once, costs two bytes per producer at
+    load time and leaves every later send genuinely asynchronous.
+    """
+    me = dist.get_rank()
+    probe = torch.zeros(1, dtype=torch.bfloat16, device="cuda")
+    for src in producers:
+        # Sequential by producer: only the two peers involved take part, and
+        # neither is waiting on anything else at this point.
+        if me == src:
+            dist.isend(probe, dst=dst, group=group).wait()
+        elif me == dst:
+            dist.irecv(probe, src=src, group=group).wait()
 
 
 class AuxTapSender:
@@ -146,14 +175,27 @@ def init_aux_pp_transport(
     if inner is None or not getattr(inner, "supports_aux_hidden_states_over_pp", False):
         return None, None
 
-    # Collective, so it has to happen before any rank-dependent return below.
-    aux_group = _new_aux_pp_group()
-
     last = pp.world_size - 1
     rank = pp.rank_in_group
     prefix = inner.AUX_HIDDEN_STATE_KEY
+
+    # The layout follows from the partition, not from who is asking, so every
+    # rank derives the same producer list and the setup below stays collective.
+    producers = [
+        r
+        for r in range(last - 1)
+        if inner._num_local_taps_on_rank(r, pp.world_size) > 0
+    ]
+    if not producers:
+        return None, None
+
+    aux_group = _new_aux_pp_group()
+    _warm_up_tap_connections(
+        aux_group, [pp.ranks[r] for r in producers], pp.ranks[last]
+    )
+
     if rank < last - 1:
-        if inner._num_local_taps_on_rank(rank, pp.world_size) == 0:
+        if rank not in producers:
             return None, None
         return AuxTapSender(prefix, pp.world_size, aux_group), None
     if rank == last:
