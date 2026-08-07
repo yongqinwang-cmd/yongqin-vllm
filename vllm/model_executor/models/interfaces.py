@@ -1461,7 +1461,7 @@ class EagleModelMixin:
         """
         raise NotImplementedError
 
-    def _boundary_aux_slot(self) -> int | None:
+    def _compute_boundary_aux_slot(self) -> int | None:
         """Slot of the pre-last stage's end-of-window tap, if it need not be sent.
 
         A tap taken at a stage's ``end_layer`` is a function of the hidden states
@@ -1486,8 +1486,32 @@ class EagleModelMixin:
             return None
         return self._aux_slot_base(producer, pp.world_size) + len(taps) - 1
 
+    # Resolved once at setup. get_pp_indices logs when a stage split is uneven
+    # and dynamo cannot trace a logging call, so deriving the layout inside the
+    # forward breaks full-graph compile for any model whose layer count does not
+    # divide evenly by the PP size.
+    _aux_slot_base_cached: int = 0
+    _aux_upstream_total_cached: int = 0
+    _aux_boundary_slot_cached: int | None = None
+
     def _set_aux_hidden_state_layers(self, layers: tuple[int, ...]) -> None:
         self.aux_hidden_state_layers = layers
+        self._cache_aux_pp_layout()
+
+    def _cache_aux_pp_layout(self) -> None:
+        """Resolve this rank's slot layout, off the forward path."""
+        from vllm.distributed.parallel_state import get_pp_group
+
+        pp = get_pp_group()
+        if pp.world_size < 2:
+            return
+        self._aux_slot_base_cached = self._aux_slot_base(
+            pp.rank_in_group, pp.world_size
+        )
+        self._aux_upstream_total_cached = self._aux_slot_base(
+            pp.world_size - 1, pp.world_size
+        )
+        self._aux_boundary_slot_cached = self._compute_boundary_aux_slot()
 
     def _maybe_add_hidden_state(
         self,
@@ -1559,13 +1583,13 @@ class EagleModelMixin:
         pp = get_pp_group()
         if pp.world_size == 1 or pp.is_last_rank or not aux_hidden_states:
             return {}
-        base = self._aux_slot_base(pp.rank_in_group, pp.world_size)
+        base = self._aux_slot_base_cached
         tensors = {
             f"{self.AUX_HIDDEN_STATE_KEY}{base + i}": t
             for i, t in enumerate(aux_hidden_states)
         }
         if pp.rank_in_group == pp.world_size - 2:
-            boundary = self._boundary_aux_slot()
+            boundary = self._aux_boundary_slot_cached
             if boundary is not None:
                 # The last rank rebuilds this one from the hidden states below.
                 tensors.pop(f"{self.AUX_HIDDEN_STATE_KEY}{boundary}", None)
@@ -1585,12 +1609,12 @@ class EagleModelMixin:
         pp = get_pp_group()
         if not pp.is_last_rank or pp.world_size == 1:
             return []
-        total = self._aux_slot_base(pp.world_size - 1, pp.world_size)
+        total = self._aux_upstream_total_cached
         if total == 0:
             return []
 
         assert intermediate_tensors is not None
-        boundary = self._boundary_aux_slot()
+        boundary = self._aux_boundary_slot_cached
         out: list[torch.Tensor] = []
         for i in range(total):
             if i == boundary:
